@@ -38,7 +38,7 @@ CURL_VERSION="curl-7.74.0"
 nohttp2="0"
 catalyst="0"
 FORCE_SSLV3="no"
-CONF_FLAGS="--without-libidn2 --disable-shared --enable-static -with-random=/dev/urandom"
+CONF_FLAGS="--without-libidn2 --disable-ldap --with-secure-transport --with-ca-fallback --disable-shared --enable-static -with-random=/dev/urandom"
 
 # Set minimum OS versions for target
 MACOS_X86_64_VERSION=""			# Empty = use host version
@@ -353,6 +353,8 @@ buildIOS()
 	else
 		./configure -prefix="/tmp/${CURL_VERSION}-iOS-${ARCH}-${BITCODE}" $CONF_FLAGS --with-ssl=${OPENSSL}/${PLATFORMDIR} ${NGHTTP2CFG} --host="${ARCH}-apple-darwin" &> "/tmp/${CURL_VERSION}-iOS-${ARCH}-${BITCODE}.log"
 	fi
+
+	# less "/tmp/${CURL_VERSION}-iOS-${ARCH}-${BITCODE}.log"
 
 	make -j${CORES} >> "/tmp/${CURL_VERSION}-iOS-${ARCH}-${BITCODE}.log" 2>&1
 	make install >> "/tmp/${CURL_VERSION}-iOS-${ARCH}-${BITCODE}.log" 2>&1
