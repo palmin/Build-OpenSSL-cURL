@@ -95,6 +95,9 @@ usage ()
     exit 127
 }
 
+echo "You probably want to call with: ./build.sh -b -d"
+sleep 3
+
 # Process command line arguments
 while getopts "o:c:n:u:s:t:i:a:debm3xh\?" o; do
     case "${o}" in
