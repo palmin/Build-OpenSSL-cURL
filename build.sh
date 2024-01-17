@@ -95,7 +95,7 @@ usage ()
     exit 127
 }
 
-echo "You probably want to call with: ./build.sh -b -d"
+echo "You probably want to call with: ./build.sh -b -d -e"
 sleep 3
 
 # Process command line arguments
