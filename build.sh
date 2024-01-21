@@ -14,7 +14,7 @@ set -e
 ################################################
 
 #OPENSSL="1.1.1u"	# https://www.openssl.org/source/ 
-OPENSSL="3.0.9"		# https://www.openssl.org/source/ 
+OPENSSL="3.0.12"		# https://www.openssl.org/source/ 
 LIBCURL="8.1.2"		# https://curl.haxx.se/download.html
 NGHTTP2="1.55.1"	# https://nghttp2.org/
 
