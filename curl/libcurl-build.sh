@@ -38,7 +38,7 @@ CURL_VERSION="curl-7.74.0"
 nohttp2="0"
 catalyst="0"
 FORCE_SSLV3="no"
-CONF_FLAGS="--without-libidn2 --disable-ldap --disable-http --disable-file --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt     --with-ca-fallback --disable-shared --enable-static -with-random=/dev/urandom"
+CONF_FLAGS="--without-libidn2 --disable-ldap --disable-http --disable-file --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt     --with-ca-fallback --disable-shared --with-libssh2 --enable-static -with-random=/dev/urandom"
 
 # Set minimum OS versions for target
 MACOS_X86_64_VERSION=""			# Empty = use host version
