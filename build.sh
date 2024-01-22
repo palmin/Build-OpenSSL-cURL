@@ -249,23 +249,14 @@ mkdir -p "$ARCHIVE/xcframework"
 # libraries for libcurl, libcrypto and libssl
 cp curl/lib/libcurl_iOS.a $ARCHIVE/lib/iOS/libcurl.a
 cp curl/lib/libcurl_iOS-simulator.a $ARCHIVE/lib/iOS-simulator/libcurl.a
-cp curl/lib/libcurl_iOS-fat.a $ARCHIVE/lib/iOS-fat/libcurl.a
-cp curl/lib/libcurl_tvOS.a $ARCHIVE/lib/tvOS/libcurl.a
-cp curl/lib/libcurl_tvOS-simulator.a $ARCHIVE/lib/tvOS-simulator/libcurl.a
 cp curl/lib/libcurl_Mac.a $ARCHIVE/lib/MacOS/libcurl.a
 
 cp openssl/iOS/lib/libcrypto.a $ARCHIVE/lib/iOS/libcrypto.a
 cp openssl/iOS-simulator/lib/libcrypto.a $ARCHIVE/lib/iOS-simulator/libcrypto.a
-cp openssl/iOS-fat/lib/libcrypto.a $ARCHIVE/lib/iOS-fat/libcrypto.a
-cp openssl/tvOS/lib/libcrypto.a $ARCHIVE/lib/tvOS/libcrypto.a
-cp openssl/tvOS-simulator/lib/libcrypto.a $ARCHIVE/lib/tvOS-simulator/libcrypto.a
 cp openssl/Mac/lib/libcrypto.a $ARCHIVE/lib/MacOS/libcrypto.a
 
 cp openssl/iOS/lib/libssl.a $ARCHIVE/lib/iOS/libssl.a
 cp openssl/iOS-simulator/lib/libssl.a $ARCHIVE/lib/iOS-simulator/libssl.a
-cp openssl/iOS-fat/lib/libssl.a $ARCHIVE/lib/iOS-fat/libssl.a
-cp openssl/tvOS/lib/libssl.a $ARCHIVE/lib/tvOS/libssl.a
-cp openssl/tvOS-simulator/lib/libssl.a $ARCHIVE/lib/tvOS-simulator/libssl.a
 cp openssl/Mac/lib/libssl.a $ARCHIVE/lib/MacOS/libssl.a
 
 if [ "$catalyst" != "" ]; then
@@ -318,10 +309,6 @@ else
         -headers curl/include \
 		-library $ARCHIVE/lib/iOS-simulator/libcurl.a \
         -headers curl/include \
-		-library $ARCHIVE/lib/tvOS/libcurl.a \
-        -headers curl/include \
-		-library $ARCHIVE/lib/tvOS-simulator/libcurl.a \
-        -headers curl/include \
         -library $ARCHIVE/lib/MacOS/libcurl.a \
         -headers curl/include \
 		-output $ARCHIVE/xcframework/libcurl.xcframework
@@ -330,18 +317,12 @@ else
         -headers openssl/iOS/include \
 		-library $ARCHIVE/lib/iOS-simulator/libcrypto.a \
         -headers openssl/iOS-simulator/include \
-		-library $ARCHIVE/lib/tvOS/libcrypto.a \
-        -headers openssl/tvOS/include \
-		-library $ARCHIVE/lib/tvOS-simulator/libcrypto.a \
-        -headers openssl/tvOS-simulator/include \
         -library $ARCHIVE/lib/MacOS/libcrypto.a \
         -headers openssl/Mac/include \
 		-output $ARCHIVE/xcframework/libcrypto.xcframework
 	xcodebuild -create-xcframework \
 		-library $ARCHIVE/lib/iOS/libssl.a \
 		-library $ARCHIVE/lib/iOS-simulator/libssl.a \
-		-library $ARCHIVE/lib/tvOS/libssl.a \
-		-library $ARCHIVE/lib/tvOS-simulator/libssl.a \
         -library $ARCHIVE/lib/MacOS/libssl.a \
 		-output $ARCHIVE/xcframework/libssl.xcframework
 fi
