@@ -36,15 +36,9 @@ for combo in "${combinations[@]}"; do
     export SDKROOT="${DEVELOPER}/Platforms/${PLATFORM}.platform/Developer/SDKs/${PLATFORM}.sdk"
     export CFLAGS="-arch $ARCH -pipe -no-cpp-precomp -isysroot $SDKROOT"
 
-    # Special case for arm64 MacOSX to make it clear we are not building for iOS
-    CMAKE_EXTRA=""
-    #if [ "$PLATFORM" = "MacOSX" ] && [ "$ARCH" = "arm64" ]; then
-	#    CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_SYSROOT=$SDKROOT "
-	#fi
-
     # Run cmake and build commands
-    echo cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON $CMAKE_EXTRA ..
-    cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON $CMAKE_EXTRA ..
+    echo cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON ..
+    cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON ..
     cmake --build .
     make install
 
@@ -52,6 +46,6 @@ for combo in "${combinations[@]}"; do
     cd ..
 done
 
-
-
-# MACOSX_MIN_SDK_VERSION="10.15"
+echo
+echo "Building completed"
+echo "------------------------------------------------"
