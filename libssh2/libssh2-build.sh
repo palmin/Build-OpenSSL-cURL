@@ -46,6 +46,13 @@ for combo in "${combinations[@]}"; do
     cd ..
 done
 
+echo "Creating framework"
+xcodebuild -create-xcframework \
+			-library build-macos-x86_64/install/lib/libssh2.a \
+			-library build-sim-x86_64/install/lib/libssh2.a \
+			-library build-ios-arm64/install/lib/libssh2.a \
+			-output ../libssh2.xcframework
+
 echo
 echo "Building completed"
 echo "------------------------------------------------"
