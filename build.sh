@@ -184,6 +184,12 @@ echo -e "${bold}Building OpenSSL${normal}"
 ./openssl-build.sh -v "$OPENSSL" $engine $colorflag $catalyst $sslv3 $OSARGS
 cd ..
 
+## LibSSH2 Build
+cd libssh2
+echo -e "${bold}Building LibSSH2${normal}"
+./libssh2-build.sh
+cd ..
+
 ## Nghttp2 Build
 if [ "$buildnghttp2" == "" ]; then
 	NGHTTP2="NONE"
