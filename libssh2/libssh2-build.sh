@@ -59,8 +59,12 @@ done
 
 echo "Creating framework"
 rm -fr ../libssh2.xcframework
+
+lipo -create  build-macos-x86_64/install/lib/libssh2.a  build-macos-arm64/install/lib/libssh2.a -output macos-libssh2.a  
+
+
 xcodebuild -create-xcframework \
-			-library build-macos-x86_64/install/lib/libssh2.a \
+			-library macos-libssh2.a  \
 			-library build-sim-x86_64/install/lib/libssh2.a \
 			-library build-ios-arm64/install/lib/libssh2.a \
 			-output ../libssh2.xcframework
