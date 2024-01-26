@@ -210,7 +210,7 @@ buildMac()
 	TARGET="darwin-i386-cc"
 	BUILD_MACHINE=`uname -m`
 	export CC="clang"
-	export CFLAGS="-arch ${ARCH} -pipe -Os -gdwarf-2 -fembed-bitcode"
+	export CFLAGS="-arch ${ARCH} -pipe -Os -gdwarf-2"
 	export LDFLAGS="-arch ${ARCH} -L${OPENSSL}/Mac/lib ${NGHTTP2LIB}"
 
 	if [[ $ARCH == "x86_64" ]]; then
@@ -221,12 +221,12 @@ buildMac()
    			# Apple ARM Silicon Build Machine Detected - cross compile
 			export CC="clang"
 			export CXX="clang"
-			export CFLAGS=" -mmacosx-version-min=${MACOS_X86_64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 -fembed-bitcode "
+			export CFLAGS=" -mmacosx-version-min=${MACOS_X86_64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 "
 			export LDFLAGS=" -arch ${ARCH} -isysroot ${DEVELOPER}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk -L${OPENSSL}/Mac/lib ${NGHTTP2LIB} "
 			export CPPFLAGS=" -I.. -isysroot ${DEVELOPER}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk "
 		else
 			# Apple x86_64 Build Machine Detected - native build
-			export CFLAGS=" -mmacosx-version-min=${MACOS_X86_64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 -fembed-bitcode "
+			export CFLAGS=" -mmacosx-version-min=${MACOS_X86_64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 "
 		fi
 	fi
 	if [[ $ARCH == "arm64" ]]; then
@@ -236,13 +236,13 @@ buildMac()
 		if [ ${BUILD_MACHINE} == 'arm64' ]; then
    			# Apple ARM Silicon Build Machine Detected - native build
 			export CC="${DEVELOPER}/usr/bin/gcc"
-			export CFLAGS=" -mmacosx-version-min=${MACOS_ARM64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 -fembed-bitcode "
+			export CFLAGS=" -mmacosx-version-min=${MACOS_ARM64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 "
 		else
 			# Apple x86_64 Build Machine Detected - cross compile
 			TARGET="darwin64-arm64-cc"
 			export CC="clang"
 			export CXX="clang"
-			export CFLAGS=" -mmacosx-version-min=${MACOS_ARM64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 -fembed-bitcode "
+			export CFLAGS=" -mmacosx-version-min=${MACOS_ARM64_VERSION} -arch ${ARCH} -pipe -Os -gdwarf-2 "
 			export LDFLAGS=" -arch ${ARCH} -isysroot ${DEVELOPER}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk -L${OPENSSL}/Mac/lib ${NGHTTP2LIB} "
 			export CPPFLAGS=" -I.. -isysroot ${DEVELOPER}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk "
 		fi
@@ -328,11 +328,7 @@ buildIOS()
 	PLATFORM="iPhoneOS"
 	PLATFORMDIR="iOS"
 
-	if [[ "${BITCODE}" == "nobitcode" ]]; then
-		CC_BITCODE_FLAG=""
-	else
-		CC_BITCODE_FLAG="-fembed-bitcode"
-	fi
+	CC_BITCODE_FLAG=""
 
 	if [ $nohttp2 == "1" ]; then
 		NGHTTP2CFG="--with-nghttp2=${NGHTTP2}/${PLATFORMDIR}/${ARCH}"
@@ -378,12 +374,8 @@ buildIOSsim()
 	PLATFORM="iPhoneSimulator"
 	PLATFORMDIR="iOS-simulator"
 
-	if [[ "${BITCODE}" == "nobitcode" ]]; then
-		CC_BITCODE_FLAG=""
-	else
-		CC_BITCODE_FLAG="-fembed-bitcode"
-	fi
-
+	CC_BITCODE_FLAG=""
+	
 	if [ $nohttp2 == "1" ]; then
 		NGHTTP2CFG="--with-nghttp2=${NGHTTP2}/${PLATFORMDIR}/${ARCH}"
 		NGHTTP2LIB="-L${NGHTTP2}/${PLATFORMDIR}/${ARCH}/lib"
