@@ -8,7 +8,7 @@
 set -e
 
 # Default Version
-VERSION="openssl-3.0.9"
+VERSION="openssl-3.0.12"
 
 # Phase 1 - Mac, Catalyst and tvOS
 OPENSSL_VERSION="$VERSION" ./openssl-build-phase1.sh "$@"
