@@ -18,6 +18,7 @@ combinations=(
 )
 
 export DEVELOPER=$(xcode-select -print-path)
+OPTFLAG=-O3
 
 for combo in "${combinations[@]}"; do
     # Read the variables from the current combination
@@ -34,13 +35,23 @@ for combo in "${combinations[@]}"; do
 
     # Set SDKROOT and CFLAGS
     export SDKROOT="${DEVELOPER}/Platforms/${PLATFORM}.platform/Developer/SDKs/${PLATFORM}.sdk"
-    export CFLAGS="-arch $ARCH -pipe -no-cpp-precomp -isysroot $SDKROOT"
+    export CFLAGS="-arch $ARCH $OPTFLAG -pipe -no-cpp-precomp -isysroot $SDKROOT"
+
+    # Special case for arm64 MacOSX to make it clear we are not building for iOS
+    CMAKE_EXTRA=""
+    if [ "$PLATFORM" = "MacOSX" ]; then
+	    CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_SYSROOT=$SDKROOT "
+	fi
 
     # Run cmake and build commands
-    echo cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON -DBUILD_SHARED_LIBS=OFF ..
-    cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON -DBUILD_SHARED_LIBS=OFF ..
+    echo cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON -DBUILD_SHARED_LIBS=OFF $CMAKE_EXTRA ..
+    cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON -DBUILD_SHARED_LIBS=OFF $CMAKE_EXTRA ..
     cmake --build .
     make install
+    
+    echo
+    lipo -info $PWD/install/lib/libssh2.a
+    echo
 
     # Return to the original directory
     cd ..
