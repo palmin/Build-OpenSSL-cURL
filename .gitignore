@@ -56,3 +56,23 @@ releases
 sandbox/
 example/iOS\ Test\ App/libs/
 /libssh2/libssh2
+/example/iOS Test App/include/openssl/cmserr.h
+/example/iOS Test App/include/openssl/configuration.h
+/example/iOS Test App/include/openssl/dh.h
+/example/iOS Test App/include/openssl/evp.h
+/example/iOS Test App/include/openssl/opensslv.h
+/example/iOS Test App/include/openssl/pkcs7.h
+/example/iOS Test App/include/openssl/x509err.h
+/example/iOS Test App/iOS Test App/cacert.pem
+/curl/curl-8.1.2
+/curl/libssh2
+/curl/libssh2.a
+/libssh2/libssh2.xcframework
+/openssl/iOS
+/openssl/iOS-fat
+/openssl/iOS-simulator
+/openssl/Mac
+/openssl/openssl-ios-armv7_armv7s_arm64_arm64e.a
+/openssl/openssl-ios-i386_x86_64_arm64-simulator.a
+/openssl/tvOS
+/openssl/tvOS-simulator
