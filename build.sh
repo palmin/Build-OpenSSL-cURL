@@ -256,10 +256,14 @@ cp curl/lib/libcurl_tvOS-simulator.a $ARCHIVE/lib/tvOS-simulator/libcurl.a
 cp openssl/iOS/lib/libcrypto.a $ARCHIVE/lib/iOS/libcrypto.a
 cp openssl/iOS-simulator/lib/libcrypto.a $ARCHIVE/lib/iOS-simulator/libcrypto.a
 cp openssl/Mac/lib/libcrypto.a $ARCHIVE/lib/MacOS/libcrypto.a
+cp openssl/tvOS/lib/libcrypto.a $ARCHIVE/lib/tvOS/libcrypto.a
+cp openssl/tvOS-simulator/lib/libcrypto.a $ARCHIVE/lib/tvOS-simulator/libcrypto.a
 
 cp openssl/iOS/lib/libssl.a $ARCHIVE/lib/iOS/libssl.a
 cp openssl/iOS-simulator/lib/libssl.a $ARCHIVE/lib/iOS-simulator/libssl.a
 cp openssl/Mac/lib/libssl.a $ARCHIVE/lib/MacOS/libssl.a
+cp openssl/tvOS/lib/libssl.a $ARCHIVE/lib/tvOS/libssl.a
+cp openssl/tvOS-simulator/lib/libssl.a $ARCHIVE/lib/tvOS-simulator/libssl.a
 
 if [ "$catalyst" != "" ]; then
 	# Add catalyst libraries
