@@ -15,6 +15,9 @@ combinations=(
     "iPhoneSimulator x86_64 $PWD/../../openssl/iOS-simulator build-sim-x86_64"
     "iPhoneSimulator arm64 $PWD/../../openssl/iOS-simulator build-sim-arm64"
     "iPhoneOS arm64 $PWD/../../openssl/iOS build-ios-arm64"
+    "AppleTVSimulator x86_64 $PWD/../../openssl/tvOS-simulator build-tvos-sim-x86_64"
+    "AppleTVSimulator arm64 $PWD/../../openssl/tvOS-simulator build-tvos-sim-arm64"
+    "AppleTVOS arm64 $PWD/../../openssl/tvOS build-tvos-arm64"
 )
 
 export DEVELOPER=$(xcode-select -print-path)
@@ -62,12 +65,15 @@ rm -fr ../libssh2.xcframework
 
 lipo -create  build-macos-x86_64/install/lib/libssh2.a  build-macos-arm64/install/lib/libssh2.a -output macos-libssh2.a  
 
-
+echo Creating libssh2.xcframework
 xcodebuild -create-xcframework \
-			-library macos-libssh2.a  \
-			-library build-sim-x86_64/install/lib/libssh2.a \
-			-library build-ios-arm64/install/lib/libssh2.a \
-			-output ../libssh2.xcframework
+    -library macos-libssh2.a  \
+    -library build-macos-arm64/install/lib/libssh2.a \
+    -library build-sim-x86_64/install/lib/libssh2.a \
+    -library build-sim-arm64/install/lib/libssh2.a \
+    -library build-ios-arm64/install/lib/libssh2.a \
+    -library build-tvos-arm64/install/lib/libssh2.a \
+    -output ../libssh2.xcframework
 
 echo
 echo "Building completed"
