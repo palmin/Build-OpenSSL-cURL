@@ -109,3 +109,5 @@ example/iOS\ Test\ App/libs/
 /libssh2/tests
 /libssh2/vms
 /openssl
+/curl/lib
+/curl
