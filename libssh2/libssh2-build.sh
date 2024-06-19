@@ -44,7 +44,9 @@ for combo in "${combinations[@]}"; do
     CMAKE_EXTRA=""
     if [ "$PLATFORM" = "MacOSX" ]; then
 	    CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_SYSROOT=$SDKROOT "
-	fi
+	elif [[ "$PLATFORM" == "AppleTVOS" || "$PLATFORM" == "AppleTVSimulator" ]]; then
+        CMAKE_EXTRA="-DCMAKE_SYSTEM_NAME=tvOS -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_SYSROOT=$SDKROOT "
+    fi
 
     # Run cmake and build commands
     echo cmake -DCMAKE_INSTALL_PREFIX=$PWD/install -DCRYPTO_BACKEND=OpenSSL -DOPENSSL_ROOT_DIR=${OPENSSLDIR} -DOPENSSL_LIBRARIES=${OPENSSLDIR}/lib -DENABLE_ZLIB_COMPRESSION=ON -DBUILD_SHARED_LIBS=OFF $CMAKE_EXTRA ..
@@ -64,16 +66,15 @@ echo "Creating framework"
 rm -fr ../libssh2.xcframework
 
 lipo -create  build-macos-x86_64/install/lib/libssh2.a  build-macos-arm64/install/lib/libssh2.a -output macos-libssh2.a  
+lipo -create  build-tvos-sim-x86_64/install/lib/libssh2.a  build-tvos-sim-arm64/install/lib/libssh2.a -output tvos-sim-libssh2.a  
 
 echo Creating libssh2.xcframework
 xcodebuild -create-xcframework \
-    -library macos-libssh2.a  \
-    -library build-macos-arm64/install/lib/libssh2.a \
-    -library build-sim-x86_64/install/lib/libssh2.a \
-    -library build-sim-arm64/install/lib/libssh2.a \
-    -library build-ios-arm64/install/lib/libssh2.a \
-    -library build-tvos-arm64/install/lib/libssh2.a \
-    -output ../libssh2.xcframework
+			-library macos-libssh2.a  \
+			-library tvos-sim-libssh2.a  \
+			-library build-sim-x86_64/install/lib/libssh2.a \
+			-library build-ios-arm64/install/lib/libssh2.a \
+			-output ../libssh2.xcframework
 
 echo
 echo "Building completed"
