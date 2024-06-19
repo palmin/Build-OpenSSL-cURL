@@ -320,6 +320,9 @@ buildTVOS()
 		LANG=C sed -i -- 's/undef NO_FORK/define NO_FORK/' "./crypto/async/arch/async_posix.h"
 		export CC="${BUILD_TOOLS}/usr/bin/gcc -arch ${ARCH}"
 	fi
+	
+	# Patch crypto/ui/ui_openssl.c to explicitly declare the type of intr_signal
+	LANG=C sed -i -- 's/static volatile intr_signal;/static volatile int intr_signal;/' "./crypto/ui/ui_openssl.c"
 
 	# Patch Configure to build for tvOS, not iOS
 	LANG=C sed -i -- 's/D\_REENTRANT\:iOS/D\_REENTRANT\:tvOS/' "./Configure"
