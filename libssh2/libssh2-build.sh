@@ -10,6 +10,7 @@ git checkout 1c3f1b7da588f2652260285529ec3c1f1125eb4e # libssh2 1.11.1
 
 # Define the combinations of PLATFORM, ARCH, OPENSSLDIR, and FOLDER
 combinations=(
+    "AppleTVSimulator arm64 $PWD/../../openssl/tvOS-simulator build-tvos-sim-arm64"
     "AppleTVOS arm64 $PWD/../../openssl/tvOS build-tvos-arm64"
     "MacOSX x86_64 $PWD/../../openssl/Mac build-macos-x86_64"
     "MacOSX arm64 $PWD/../../openssl/Mac build-macos-arm64"
@@ -75,6 +76,7 @@ echo Creating libssh2.xcframework
 xcodebuild -create-xcframework                               \
 			-library macos-libssh2.a                         \
 			-library build-tvos-arm64/install/lib/libssh2.a  \
+			-library build-tvos-sim-arm64/install/lib/libssh2.a  \
 			-library build-sim-x86_64/install/lib/libssh2.a  \
 			-library build-ios-arm64/install/lib/libssh2.a   \
 			-output ../libssh2.xcframework
