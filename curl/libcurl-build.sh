@@ -252,6 +252,7 @@ buildMac()
 
 	pushd . > /dev/null
 	cd "${CURL_VERSION}"
+	echo "Building in ${CURL_VERSION}"
 	./configure -prefix="/tmp/${CURL_VERSION}-${ARCH}" $CONF_FLAGS $SSHFLAGS --with-ssl=${OPENSSL}/Mac ${NGHTTP2CFG} --host=${HOST} &> "/tmp/${CURL_VERSION}-${ARCH}.log"
 
 	make -j${CORES} >> "/tmp/${CURL_VERSION}-${ARCH}.log" 2>&1
@@ -544,6 +545,10 @@ fi
 
 echo -e "${dim}Unpacking curl"
 tar xfz "${CURL_VERSION}.tar.gz"
+
+echo Applying MDLS like patch
+echo cp ../custom-curl-libssh2.c "${CURL_VERSION}/lib/vssh/libssh2.c"
+cp ../custom-curl-libssh2.c "${CURL_VERSION}/lib/vssh/libssh2.c"
 
 if [ ${FORCE_SSLV3} == 'yes' ]; then
 	if version_lte ${CURL_VERSION} "curl-7.76.1"; then
