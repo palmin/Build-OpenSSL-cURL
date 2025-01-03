@@ -2345,6 +2345,33 @@ static CURLcode ssh_statemach_act(struct Curl_easy *data, bool *block)
           Curl_debug(data, CURLINFO_DATA_IN, (char *)"\n", 1);
         }
         else {
+          /* Prefix with FTP MLSD output for access + modify dates */
+
+          result = 0; // first time we get non-zero result we stop
+
+          if(!result && (sshp->readdir_attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)) {
+              result = Curl_dyn_addf(&sshp->readdir, "access.epoch=%ld;", 
+                                     sshp->readdir_attrs.atime);
+          }
+
+          if(!result && (sshp->readdir_attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)) {
+              result = Curl_dyn_addf(&sshp->readdir, "modify.epoch=%ld;", 
+                                     sshp->readdir_attrs.mtime);
+          }
+
+          if(!result) {
+              // add filename
+              result = Curl_dyn_add(&sshp->readdir, " ");
+          } 
+
+          if(result) {
+              /* something failed */
+              sshc->actualcode = result;
+              state(data, SSH_SFTP_CLOSE);
+              break;
+          }
+
+          // continue with regular entry
           result = Curl_dyn_add(&sshp->readdir, sshp->readdir_longentry);
 
           if(!result) {
