@@ -4,9 +4,9 @@
 set -e
 
 rm -fr libssh2
-git clone https://github.com/libssh2/libssh2/
+git clone https://github.com/palmin/libssh2/
 cd libssh2
-git checkout 1c3f1b7da588f2652260285529ec3c1f1125eb4e # libssh2 1.11.1
+git checkout fde216d693998da03846b9c8e58528133ec91a92 # libssh2 1.11.1
 
 # Define the combinations of PLATFORM, ARCH, OPENSSLDIR, and FOLDER
 combinations=(
