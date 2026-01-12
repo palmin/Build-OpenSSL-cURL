@@ -2355,8 +2355,18 @@ static CURLcode ssh_statemach_act(struct Curl_easy *data, bool *block)
           }
 
           if(!result && (sshp->readdir_attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME)) {
-              result = Curl_dyn_addf(&sshp->readdir, "modify.epoch=%ld;", 
+              result = Curl_dyn_addf(&sshp->readdir, "modify.epoch=%ld;",
                                      sshp->readdir_attrs.mtime);
+          }
+
+          if(!result && (sshp->readdir_attrs.flags & LIBSSH2_SFTP_ATTR_UIDGID)) {
+              result = Curl_dyn_addf(&sshp->readdir, "uid.numeric=%lu;",
+                                     sshp->readdir_attrs.uid);
+          }
+
+          if(!result && (sshp->readdir_attrs.flags & LIBSSH2_SFTP_ATTR_UIDGID)) {
+              result = Curl_dyn_addf(&sshp->readdir, "gid.numeric=%lu;",
+                                     sshp->readdir_attrs.gid);
           }
 
           if(!result) {
