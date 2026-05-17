@@ -2011,6 +2011,40 @@ static CURLcode ssh_statemach_act(struct Curl_easy *data, bool *block)
       }
       if(rc == 0) {
         data->info.filetime = attrs.mtime;
+
+        /* expose the SFTP inode type as Content-Type so callers can tell a
+           directory from a regular file without listing the parent. uses the
+           inode/* pseudo-MIME convention familiar from file managers. */
+        if(attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+          const char *content_type = NULL;
+          if(LIBSSH2_SFTP_S_ISDIR(attrs.permissions))
+            content_type = "inode/directory";
+          else if(LIBSSH2_SFTP_S_ISREG(attrs.permissions))
+            content_type = "inode/regular-file";
+          else if(LIBSSH2_SFTP_S_ISLNK(attrs.permissions))
+            content_type = "inode/symlink";
+          else if(LIBSSH2_SFTP_S_ISBLK(attrs.permissions))
+            content_type = "inode/blockdevice";
+          else if(LIBSSH2_SFTP_S_ISCHR(attrs.permissions))
+            content_type = "inode/chardevice";
+          else if(LIBSSH2_SFTP_S_ISFIFO(attrs.permissions))
+            content_type = "inode/fifo";
+          else if(LIBSSH2_SFTP_S_ISSOCK(attrs.permissions))
+            content_type = "inode/socket";
+
+          if(content_type) {
+            Curl_safefree(data->info.contenttype);
+            data->info.contenttype = strdup(content_type);
+          }
+
+          /* metadata-only request on a directory: skip the DOWNLOAD path,
+             which would try to OPEN the path as a regular file and fail */
+          if(data->req.no_body &&
+             LIBSSH2_SFTP_S_ISDIR(attrs.permissions)) {
+            state(data, SSH_STOP);
+            break;
+          }
+        }
       }
 
       state(data, SSH_SFTP_TRANS_INIT);
