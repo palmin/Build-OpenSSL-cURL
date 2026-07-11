@@ -979,11 +979,14 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
  */
 
 #define RLIST_FXP_CLOSE     4
+#define RLIST_FXP_STAT      17
+#define RLIST_FXP_READLINK  19
 #define RLIST_FXP_OPENDIR   11
 #define RLIST_FXP_READDIR   12
 #define RLIST_FXP_STATUS    101
 #define RLIST_FXP_HANDLE    102
 #define RLIST_FXP_NAME      104
+#define RLIST_FXP_ATTRS     105
 #define RLIST_FX_EOF        1
 #define RLIST_WINDOW        24            /* directories in flight at once */
 #define RLIST_MAX_PACKET    (8*1024*1024) /* sanity cap on a response packet */
@@ -998,14 +1001,23 @@ struct rlist_sftp_peek {
   uint32_t version;
 };
 
-enum rlist_phase { RL_FREE = 0, RL_OPENING, RL_READING, RL_CLOSING };
+enum rlist_phase { RL_FREE = 0, RL_OPENING, RL_READING, RL_CLOSING,
+                   RL_STATTING, RL_READLINKING };
 
 struct rlist_slot {
-  char *relpath;                 /* path relative to root; owned by the slot */
+  char *relpath;                 /* dir: path relative to root; symlink: path to emit */
   unsigned char handle[256];
   uint32_t handle_len;
   enum rlist_phase phase;
   uint32_t request_id;           /* the slot's currently outstanding request */
+  /* symlink resolution runs RL_STATTING (FXP_STAT -> target kind/size/mtime) then
+     RL_READLINKING (FXP_READLINK -> target string). rtype/linksize/linkmtime carry
+     the resolved values between the two; linksize/linkmtime start as the link's own
+     (the fallback emitted for a broken link). */
+  char rtype;                    /* resolved kind: 'd'/'f', or 'l' for a broken link */
+  char *target;                  /* retained field; the target string now comes from readlink */
+  unsigned long long linksize;
+  unsigned long linkmtime;
 };
 
 /* FIFO queue of heap-allocated relative-path strings (BFS order) */
@@ -1047,6 +1059,64 @@ static void rlist_free(struct rlist_queue *q)
   size_t i;
   for(i = q->head; i < q->count; i++)
     free(q->items[i]);
+  free(q->items);
+  q->items = NULL;
+  q->head = q->count = q->cap = 0;
+}
+
+/* FIFO of symlinks discovered during the walk, awaiting a pipelined stat.
+   relpath and target are heap-allocated and owned by the queue until popped. */
+struct rlist_symlink {
+  char *relpath;
+  char *target;                  /* link destination string, or NULL */
+  unsigned long long linksize;   /* the link's own size (fallback for broken links) */
+  unsigned long linkmtime;       /* the link's own mtime (fallback for broken links) */
+};
+
+struct rlist_symqueue {
+  struct rlist_symlink *items;
+  size_t head;
+  size_t count;
+  size_t cap;
+};
+
+/* takes ownership of relpath and target */
+static CURLcode rlist_sympush(struct rlist_symqueue *q, char *relpath,
+                              char *target, unsigned long long sz,
+                              unsigned long mt)
+{
+  if(q->count == q->cap) {
+    size_t ncap = q->cap ? q->cap * 2 : 64;
+    struct rlist_symlink *n = realloc(q->items, ncap * sizeof(*n));
+    if(!n)
+      return CURLE_OUT_OF_MEMORY;
+    q->items = n;
+    q->cap = ncap;
+  }
+  q->items[q->count].relpath = relpath;
+  q->items[q->count].target = target;
+  q->items[q->count].linksize = sz;
+  q->items[q->count].linkmtime = mt;
+  q->count++;
+  return CURLE_OK;
+}
+
+/* pops into *out (ownership moves to caller); returns 1 if popped, 0 if empty */
+static int rlist_sympop(struct rlist_symqueue *q, struct rlist_symlink *out)
+{
+  if(q->head >= q->count)
+    return 0;
+  *out = q->items[q->head++];
+  return 1;
+}
+
+static void rlist_symqueue_free(struct rlist_symqueue *q)
+{
+  size_t i;
+  for(i = q->head; i < q->count; i++) {
+    free(q->items[i].relpath);
+    free(q->items[i].target);
+  }
   free(q->items);
   q->items = NULL;
   q->head = q->count = q->cap = 0;
@@ -1164,7 +1234,117 @@ static struct rlist_slot *rlist_find(struct rlist_slot *slots, uint32_t req)
   return NULL;
 }
 
-static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
+/* escape a byte range into a malloc'd C-string: backslash, tab, newline and CR
+   become \\ \t \n \r so the tab field separator and the '\n' record terminator
+   stay unambiguous for any path. stops at an embedded NUL (as %.*s would). */
+static char *rlist_escape_n(const char *s, size_t len)
+{
+  size_t i, n = 0;
+  char *out, *w;
+  for(i = 0; i < len && s[i]; i++)
+    n += (s[i] == '\\' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') ? 2 : 1;
+  out = malloc(n + 1);
+  if(!out)
+    return NULL;
+  w = out;
+  for(i = 0; i < len && s[i]; i++) {
+    switch(s[i]) {
+    case '\\': *w++ = '\\'; *w++ = '\\'; break;
+    case '\t': *w++ = '\\'; *w++ = 't';  break;
+    case '\n': *w++ = '\\'; *w++ = 'n';  break;
+    case '\r': *w++ = '\\'; *w++ = 'r';  break;
+    default:   *w++ = s[i];
+    }
+  }
+  *w = '\0';
+  return out;
+}
+
+/* emit one listing line: "<t> <size> <mtime> <esc(name)>[\t<esc(target)>]\n".
+   target is a NUL-terminated link destination for symlinks, or NULL. */
+static CURLcode rlist_emit(struct Curl_easy *data, char t,
+                           unsigned long long sz, unsigned long mtime,
+                           const char *name, size_t namelen,
+                           const char *target)
+{
+  char *en = rlist_escape_n(name, namelen);
+  char *et = target ? rlist_escape_n(target, strlen(target)) : NULL;
+  char *line;
+  CURLcode w;
+  if(!en || (target && !et)) {
+    free(en);
+    free(et);
+    return CURLE_OUT_OF_MEMORY;
+  }
+  line = et ? aprintf("%c %llu %lu %s\t%s\n", t, sz, mtime, en, et)
+            : aprintf("%c %llu %lu %s\n", t, sz, mtime, en);
+  free(en);
+  free(et);
+  if(!line)
+    return CURLE_OUT_OF_MEMORY;
+  w = Curl_client_write(data, CLIENTWRITE_BODY, line, strlen(line));
+  free(line);
+  return w;
+}
+
+/* parse an SFTP ATTRS blob at *pp (advancing it), filling size/perms/mtime when
+   the matching flag is present. returns 0 on success, -1 on truncation. */
+static int rlist_parse_attrs(const unsigned char **pp, size_t *leftp,
+                             unsigned long long *sz, unsigned long *perms,
+                             unsigned long *mtime)
+{
+  const unsigned char *p = *pp;
+  size_t left = *leftp;
+  uint32_t flags;
+  if(left < 4)
+    return -1;
+  flags = rlist_ntohu32(p); p += 4; left -= 4;
+  if(flags & LIBSSH2_SFTP_ATTR_SIZE) {
+    if(left < 8) return -1;
+    *sz = (unsigned long long)rlist_ntohu64(p); p += 8; left -= 8;
+  }
+  if(flags & LIBSSH2_SFTP_ATTR_UIDGID) {
+    if(left < 8) return -1;
+    p += 8; left -= 8;
+  }
+  if(flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+    if(left < 4) return -1;
+    *perms = rlist_ntohu32(p); p += 4; left -= 4;
+  }
+  if(flags & LIBSSH2_SFTP_ATTR_ACMODTIME) {
+    if(left < 8) return -1;
+    *mtime = rlist_ntohu32(p + 4); p += 8; left -= 8;
+  }
+  if(flags & LIBSSH2_SFTP_ATTR_EXTENDED) {
+    uint32_t ext, e;
+    if(left < 4) return -1;
+    ext = rlist_ntohu32(p); p += 4; left -= 4;
+    for(e = 0; e < ext; e++) {
+      uint32_t tlen, dlen;
+      if(left < 4) return -1;
+      tlen = rlist_ntohu32(p); p += 4; left -= 4;
+      if(left < tlen) return -1;
+      p += tlen; left -= tlen;
+      if(left < 4) return -1;
+      dlen = rlist_ntohu32(p); p += 4; left -= 4;
+      if(left < dlen) return -1;
+      p += dlen; left -= dlen;
+    }
+  }
+  *pp = p;
+  *leftp = left;
+  return 0;
+}
+
+/* (symlink targets are obtained with FXP_READLINK, not parsed from the longname) */
+
+/* Pipelined SFTP directory walk shared by "x-listing-stat" (one directory,
+   recursive=0) and "x-list-r" (whole subtree, recursive=1). Directories are
+   opened/read with up to RLIST_WINDOW OPENDIR/READDIR requests in flight; every
+   symlink is resolved with a pipelined FXP_STAT (which follows the link) over the
+   same window, so its target kind/size is known, and its target string comes free
+   from the readdir longname. One escaped line per entry (see rlist_emit). */
+static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursive)
 {
   struct connectdata *conn = data->conn;
   struct ssh_conn *sshc = &conn->proto.sshc;
@@ -1174,54 +1354,75 @@ static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
   LIBSSH2_CHANNEL *channel = peek->channel;
   CURLcode result = CURLE_OK;
   struct rlist_slot slots[RLIST_WINDOW];
-  struct rlist_queue queue;
+  struct rlist_queue queue;       /* directories still to open (BFS order) */
+  struct rlist_symqueue symq;     /* symlinks awaiting a pipelined stat */
   int busy = 0;
-  int cancelled = 0;             /* set when consume() asks us to stop early */
+  int cancelled = 0;              /* set when consume() asks us to stop early */
   long emitted = 0;
   int i;
 
   memset(slots, 0, sizeof(slots));
   memset(&queue, 0, sizeof(queue));
+  memset(&symq, 0, sizeof(symq));
 
-  /* the root directory itself is the first relative path: "" */
-  result = rlist_push(&queue, "");
+  result = rlist_push(&queue, "");   /* the root directory itself */
 
-  while(!result && (queue.head < queue.count || busy > 0)) {
+  while(!result &&
+        (queue.head < queue.count || symq.head < symq.count || busy > 0)) {
     unsigned char header[9];
     unsigned char *payload = NULL;
     size_t payload_len;
-    uint32_t plen;
-    uint32_t reqid;
+    uint32_t plen, reqid;
     unsigned char type;
     struct rlist_slot *slot;
 
-    /* fill free slots from the queue by issuing OPENDIR (not while draining) */
-    for(i = 0; i < RLIST_WINDOW && !cancelled && queue.head < queue.count; i++) {
-      char *rel;
+    /* fill free slots: OPENDIR for queued directories, FXP_STAT for queued
+       symlinks. while draining after an early stop we issue no new work. */
+    for(i = 0; i < RLIST_WINDOW && !result && !cancelled; i++) {
       char *abspath;
       uint32_t req;
       if(slots[i].phase != RL_FREE)
         continue;
-      rel = rlist_pop(&queue);
-      abspath = rel[0] ? aprintf("%s/%s", root, rel) : strdup(root);
-      if(!abspath) {
-        free(rel);
-        result = CURLE_OUT_OF_MEMORY;
-        break;
-      }
-      req = peek->request_id++;
-      if(rlist_send(channel, sock, session, RLIST_FXP_OPENDIR, req,
-                    (const unsigned char *)abspath, strlen(abspath)) != 0) {
+      if(queue.head < queue.count) {
+        char *rel = rlist_pop(&queue);
+        abspath = rel[0] ? aprintf("%s/%s", root, rel) : strdup(root);
+        if(!abspath) { free(rel); result = CURLE_OUT_OF_MEMORY; break; }
+        req = peek->request_id++;
+        if(rlist_send(channel, sock, session, RLIST_FXP_OPENDIR, req,
+                      (const unsigned char *)abspath, strlen(abspath)) != 0) {
+          free(abspath); free(rel); result = CURLE_SSH; break;
+        }
         free(abspath);
-        free(rel);
-        result = CURLE_SSH;
-        break;
+        slots[i].relpath = rel;
+        slots[i].phase = RL_OPENING;
+        slots[i].request_id = req;
+        busy++;
       }
-      free(abspath);
-      slots[i].relpath = rel;
-      slots[i].phase = RL_OPENING;
-      slots[i].request_id = req;
-      busy++;
+      else if(symq.head < symq.count) {
+        struct rlist_symlink sl;
+        rlist_sympop(&symq, &sl);
+        abspath = sl.relpath[0] ? aprintf("%s/%s", root, sl.relpath) : strdup(root);
+        if(!abspath) {
+          free(sl.relpath); free(sl.target);
+          result = CURLE_OUT_OF_MEMORY; break;
+        }
+        req = peek->request_id++;
+        if(rlist_send(channel, sock, session, RLIST_FXP_STAT, req,
+                      (const unsigned char *)abspath, strlen(abspath)) != 0) {
+          free(abspath); free(sl.relpath); free(sl.target);
+          result = CURLE_SSH; break;
+        }
+        free(abspath);
+        slots[i].relpath = sl.relpath;   /* ownership moves into the slot */
+        slots[i].target = sl.target;
+        slots[i].linksize = sl.linksize;
+        slots[i].linkmtime = sl.linkmtime;
+        slots[i].phase = RL_STATTING;
+        slots[i].request_id = req;
+        busy++;
+      }
+      else
+        break;   /* nothing left to issue right now */
     }
     if(result)
       break;
@@ -1230,53 +1431,35 @@ static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
 
     /* read one response: 9-byte header then the payload */
     if(rlist_read(channel, sock, session, header, 9) != 0) {
-      result = CURLE_SSH;
-      break;
+      result = CURLE_SSH; break;
     }
     plen = rlist_ntohu32(header);
     type = header[4];
     reqid = rlist_ntohu32(header + 5);
-    if(plen < 5 || plen - 5 > RLIST_MAX_PACKET) {
-      result = CURLE_SSH;
-      break;
-    }
+    if(plen < 5 || plen - 5 > RLIST_MAX_PACKET) { result = CURLE_SSH; break; }
     payload_len = plen - 5;
     if(payload_len) {
       payload = malloc(payload_len);
-      if(!payload) {
-        result = CURLE_OUT_OF_MEMORY;
-        break;
-      }
+      if(!payload) { result = CURLE_OUT_OF_MEMORY; break; }
       if(rlist_read(channel, sock, session, payload, payload_len) != 0) {
-        free(payload);
-        result = CURLE_SSH;
-        break;
+        free(payload); result = CURLE_SSH; break;
       }
     }
 
     slot = rlist_find(slots, reqid);
-    if(!slot) {
-      /* response for an unknown request id — ignore defensively */
-      free(payload);
-      continue;
-    }
+    if(!slot) { free(payload); continue; }   /* unknown id — ignore defensively */
 
     if(slot->phase == RL_OPENING) {
       if(type == RLIST_FXP_HANDLE && payload_len >= 4) {
         uint32_t hlen = rlist_ntohu32(payload);
         if(hlen > sizeof(slot->handle) || (size_t)hlen + 4 > payload_len) {
-          /* unusable handle: drop this directory */
-          free(slot->relpath);
-          memset(slot, 0, sizeof(*slot));
-          busy--;
+          free(slot->relpath); memset(slot, 0, sizeof(*slot)); busy--;
         }
         else {
           memcpy(slot->handle, payload + 4, hlen);
           slot->handle_len = hlen;
           slot->request_id = peek->request_id++;
           if(cancelled) {
-            /* draining after an early stop: close what we opened so the channel
-               is left clean rather than reading the directory */
             slot->phase = RL_CLOSING;
             if(rlist_send(channel, sock, session, RLIST_FXP_CLOSE,
                           slot->request_id, slot->handle, slot->handle_len) != 0)
@@ -1292,119 +1475,76 @@ static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
       }
       else {
         /* OPENDIR failed (permission denied / vanished): skip this directory */
-        free(slot->relpath);
-        memset(slot, 0, sizeof(*slot));
-        busy--;
+        free(slot->relpath); memset(slot, 0, sizeof(*slot)); busy--;
       }
     }
     else if(slot->phase == RL_READING) {
       if(type == RLIST_FXP_NAME && !cancelled) {
         const unsigned char *p = payload;
         size_t left = payload_len;
-        uint32_t count;
-        uint32_t n;
-        if(left < 4) {
-          result = CURLE_SSH;
-        }
+        uint32_t count, n;
+        if(left < 4) result = CURLE_SSH;
         else {
-          count = rlist_ntohu32(p);
-          p += 4;
-          left -= 4;
+          count = rlist_ntohu32(p); p += 4; left -= 4;
           for(n = 0; n < count && !result && !cancelled; n++) {
-            uint32_t fn_len;
+            uint32_t fn_len, ln_len;
             const char *fname;
-            uint32_t ln_len;
-            uint32_t flags;
             unsigned long long sz = 0;
             unsigned long mtime = 0;
             unsigned long perms = 0;
-            char t;
+            int islnk, isdir;
             char *childrel;
-            char *line;
-            int isdir;
 
             /* filename */
             if(left < 4) { result = CURLE_SSH; break; }
             fn_len = rlist_ntohu32(p); p += 4; left -= 4;
             if(left < fn_len) { result = CURLE_SSH; break; }
             fname = (const char *)p; p += fn_len; left -= fn_len;
-            /* longname (ignored) */
+            /* longname (skipped — the target string comes from a readlink) */
             if(left < 4) { result = CURLE_SSH; break; }
             ln_len = rlist_ntohu32(p); p += 4; left -= 4;
             if(left < ln_len) { result = CURLE_SSH; break; }
             p += ln_len; left -= ln_len;
             /* attrs */
-            if(left < 4) { result = CURLE_SSH; break; }
-            flags = rlist_ntohu32(p); p += 4; left -= 4;
-            if(flags & LIBSSH2_SFTP_ATTR_SIZE) {
-              if(left < 8) { result = CURLE_SSH; break; }
-              sz = (unsigned long long)rlist_ntohu64(p); p += 8; left -= 8;
-            }
-            if(flags & LIBSSH2_SFTP_ATTR_UIDGID) {
-              if(left < 8) { result = CURLE_SSH; break; }
-              p += 8; left -= 8;
-            }
-            if(flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
-              if(left < 4) { result = CURLE_SSH; break; }
-              perms = rlist_ntohu32(p); p += 4; left -= 4;
-            }
-            if(flags & LIBSSH2_SFTP_ATTR_ACMODTIME) {
-              if(left < 8) { result = CURLE_SSH; break; }
-              mtime = rlist_ntohu32(p + 4); p += 8; left -= 8;
-            }
-            if(flags & LIBSSH2_SFTP_ATTR_EXTENDED) {
-              uint32_t ext;
-              uint32_t e;
-              if(left < 4) { result = CURLE_SSH; break; }
-              ext = rlist_ntohu32(p); p += 4; left -= 4;
-              for(e = 0; e < ext; e++) {
-                uint32_t tlen;
-                uint32_t dlen;
-                if(left < 4) { result = CURLE_SSH; break; }
-                tlen = rlist_ntohu32(p); p += 4; left -= 4;
-                if(left < tlen) { result = CURLE_SSH; break; }
-                p += tlen; left -= tlen;
-                if(left < 4) { result = CURLE_SSH; break; }
-                dlen = rlist_ntohu32(p); p += 4; left -= 4;
-                if(left < dlen) { result = CURLE_SSH; break; }
-                p += dlen; left -= dlen;
-              }
-              if(result) break;
+            if(rlist_parse_attrs(&p, &left, &sz, &perms, &mtime) != 0) {
+              result = CURLE_SSH; break;
             }
 
             /* skip . and .. */
-            if(fn_len == 1 && fname[0] == '.')
-              continue;
-            if(fn_len == 2 && fname[0] == '.' && fname[1] == '.')
-              continue;
-            if(emitted >= RLIST_MAX_ENTRIES)
-              continue;
+            if(fn_len == 1 && fname[0] == '.') continue;
+            if(fn_len == 2 && fname[0] == '.' && fname[1] == '.') continue;
+            if(emitted >= RLIST_MAX_ENTRIES) continue;
 
             childrel = slot->relpath[0] ?
               aprintf("%s/%.*s", slot->relpath, (int)fn_len, fname) :
               aprintf("%.*s", (int)fn_len, fname);
             if(!childrel) { result = CURLE_OUT_OF_MEMORY; break; }
 
-            t = 'f';
-            isdir = 0;
-            if(LIBSSH2_SFTP_S_ISDIR(perms)) { t = 'd'; isdir = 1; }
-            else if(LIBSSH2_SFTP_S_ISLNK(perms)) t = 'l';
-            line = aprintf("%c %llu %lu %s\n", t, sz, mtime, childrel);
-            if(!line) { free(childrel); result = CURLE_OUT_OF_MEMORY; break; }
+            isdir = LIBSSH2_SFTP_S_ISDIR(perms) ? 1 : 0;
+            islnk = LIBSSH2_SFTP_S_ISLNK(perms) ? 1 : 0;
+
+            if(islnk) {
+              /* defer emit: a symlink is resolved with a pipelined FXP_STAT (target
+                 kind) then FXP_READLINK (target string); sz/mtime are the link's own,
+                 kept as the fallback emitted for a broken link */
+              result = rlist_sympush(&symq, childrel, NULL, sz, mtime);
+              if(result) { free(childrel); break; }
+              emitted++;   /* childrel now owned by symq */
+              continue;
+            }
+
             {
-              CURLcode w = Curl_client_write(data, CLIENTWRITE_BODY, line, strlen(line));
-              free(line);
+              CURLcode w = rlist_emit(data, isdir ? 'd' : 'f', sz, mtime,
+                                      childrel, strlen(childrel), NULL);
               emitted++;
               if(w != CURLE_OK) {
-                /* the write callback returned short — consume() asked to stop.
-                   Switch to draining (not an error) so the channel is closed
-                   out cleanly and the connection stays usable. */
+                /* consume() asked to stop: drain cleanly, not an error */
                 cancelled = 1;
                 free(childrel);
                 break;
               }
             }
-            if(isdir)
+            if(isdir && recursive)
               result = rlist_push(&queue, childrel);
             free(childrel);
           }
@@ -1438,17 +1578,89 @@ static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
       memset(slot, 0, sizeof(*slot));
       busy--;
     }
+    else if(slot->phase == RL_STATTING) {
+      /* stat came back: record the resolved kind/size/mtime (or keep 'l' + the link's
+         own values for a broken link), then readlink the same path for the target
+         string (readdir's longname doesn't carry it on OpenSSH's sftp-server) */
+      slot->rtype = 'l';
+      if(type == RLIST_FXP_ATTRS) {
+        const unsigned char *p = payload;
+        size_t left = payload_len;
+        unsigned long long tsz = 0;
+        unsigned long perms = 0, tmt = 0;
+        if(rlist_parse_attrs(&p, &left, &tsz, &perms, &tmt) == 0) {
+          slot->rtype = LIBSSH2_SFTP_S_ISDIR(perms) ? 'd' : 'f';
+          slot->linksize = tsz;
+          if(tmt) slot->linkmtime = tmt;
+        }
+      }
+      {
+        char *abspath = slot->relpath[0] ? aprintf("%s/%s", root, slot->relpath)
+                                         : strdup(root);
+        if(!abspath)
+          result = CURLE_OUT_OF_MEMORY;
+        else {
+          slot->request_id = peek->request_id++;
+          slot->phase = RL_READLINKING;
+          if(rlist_send(channel, sock, session, RLIST_FXP_READLINK,
+                        slot->request_id, (const unsigned char *)abspath,
+                        strlen(abspath)) != 0)
+            result = CURLE_SSH;
+          free(abspath);
+        }
+      }
+    }
+    else if(slot->phase == RL_READLINKING) {
+      /* readlink came back: FXP_NAME's first filename is the target string. emit the
+         entry with the kind resolved by the stat and this target. */
+      char *tgt = NULL;
+      if(type == RLIST_FXP_NAME && payload_len >= 4) {
+        const unsigned char *p = payload;
+        size_t left = payload_len;
+        uint32_t cnt = rlist_ntohu32(p); p += 4; left -= 4;
+        if(cnt >= 1 && left >= 4) {
+          uint32_t tl = rlist_ntohu32(p); p += 4; left -= 4;
+          if(tl <= left) {
+            tgt = malloc(tl + 1);
+            if(tgt) { memcpy(tgt, p, tl); tgt[tl] = '\0'; }
+          }
+        }
+      }
+      if(!cancelled) {
+        CURLcode w = rlist_emit(data, slot->rtype, slot->linksize, slot->linkmtime,
+                                slot->relpath, strlen(slot->relpath), tgt);
+        if(w != CURLE_OK) cancelled = 1;
+      }
+      free(tgt);
+      free(slot->relpath); free(slot->target);
+      memset(slot, 0, sizeof(*slot));
+      busy--;
+    }
 
     free(payload);
   }
 
-  for(i = 0; i < RLIST_WINDOW; i++)
+  for(i = 0; i < RLIST_WINDOW; i++) {
     free(slots[i].relpath);
+    free(slots[i].target);
+  }
   rlist_free(&queue);
+  rlist_symqueue_free(&symq);
 #ifdef DEBUG
-  infof(data, "x-list-r: emitted %ld entries under '%s'", emitted, root);
+  infof(data, "sftp_walk: emitted %ld entries under '%s' (recursive=%d)",
+        emitted, root, recursive);
 #endif
   return result;
+}
+
+static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
+{
+  return sftp_walk(data, root, 1);
+}
+
+static CURLcode sftp_listing_stat(struct Curl_easy *data, const char *dir)
+{
+  return sftp_walk(data, dir, 0);
 }
 /* --- END custom: pipelined recursive SFTP listing ------------------------- */
 
@@ -2152,6 +2364,24 @@ static CURLcode ssh_statemach_act(struct Curl_easy *data, bool *block)
              here, streaming entries to the body, then the operation ends -- it
              is the entire transfer, so no normal directory listing follows. */
           result = sftp_recursive_list(data, sshc->quote_path1);
+          Curl_safefree(sshc->quote_path1);
+          Curl_safefree(sshc->quote_path2);
+          if(result) {
+            sshc->actualcode = result;
+            sshc->nextstate = SSH_NO_STATE;
+            state(data, SSH_SFTP_CLOSE);
+            break;
+          }
+          Curl_setup_transfer(data, -1, -1, FALSE, -1);
+          sshc->nextstate = SSH_NO_STATE;
+          state(data, SSH_STOP);
+          break;
+        }
+        else if(strncasecompare(cmd, "x-listing-stat ", 15)) {
+          /* custom: single-directory listing that also resolves every symlink's
+             target kind with a pipelined FXP_STAT on the same channel. Same
+             output format and transfer handling as x-list-r. */
+          result = sftp_listing_stat(data, sshc->quote_path1);
           Curl_safefree(sshc->quote_path1);
           Curl_safefree(sshc->quote_path2);
           if(result) {
