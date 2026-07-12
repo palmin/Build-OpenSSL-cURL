@@ -979,6 +979,7 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
  */
 
 #define RLIST_FXP_CLOSE     4
+#define RLIST_FXP_LSTAT     7
 #define RLIST_FXP_STAT      17
 #define RLIST_FXP_READLINK  19
 #define RLIST_FXP_OPENDIR   11
@@ -1661,6 +1662,145 @@ static CURLcode sftp_recursive_list(struct Curl_easy *data, const char *root)
 static CURLcode sftp_listing_stat(struct Curl_easy *data, const char *dir)
 {
   return sftp_walk(data, dir, 0);
+}
+
+/* send one single-string SFTP request (LSTAT/STAT/READLINK) and read its full response.
+   on success returns CURLE_OK with *outtype/*outpayload/*outlen set; *outpayload is
+   malloc'd (NULL when empty) and the caller frees it. Sequential: exactly one request is
+   in flight, so the next response is ours and the request-id need not be matched. */
+static CURLcode sftp_one_roundtrip(LIBSSH2_CHANNEL *channel, curl_socket_t sock,
+                                   LIBSSH2_SESSION *session,
+                                   struct rlist_sftp_peek *peek,
+                                   unsigned char reqtype, const char *path,
+                                   unsigned char *outtype,
+                                   unsigned char **outpayload, size_t *outlen)
+{
+  unsigned char header[9];
+  uint32_t plen, req = peek->request_id++;
+  *outpayload = NULL;
+  *outlen = 0;
+  if(rlist_send(channel, sock, session, reqtype, req,
+                (const unsigned char *)path, strlen(path)) != 0)
+    return CURLE_SSH;
+  if(rlist_read(channel, sock, session, header, 9) != 0)
+    return CURLE_SSH;
+  plen = rlist_ntohu32(header);
+  *outtype = header[4];
+  if(plen < 5 || plen - 5 > RLIST_MAX_PACKET)
+    return CURLE_SSH;
+  *outlen = plen - 5;
+  if(*outlen) {
+    *outpayload = malloc(*outlen);
+    if(!*outpayload)
+      return CURLE_OUT_OF_MEMORY;
+    if(rlist_read(channel, sock, session, *outpayload, *outlen) != 0) {
+      free(*outpayload);
+      *outpayload = NULL;
+      return CURLE_SSH;
+    }
+  }
+  return CURLE_OK;
+}
+
+/* Triggered by the "x-stat <path>" SFTP quote command: stat ONE path over the SFTP
+   channel with FXP_LSTAT (detect a symlink), then for a symlink FXP_STAT (follow ->
+   target kind/size/mtime) and FXP_READLINK (target string). Emits one escaped line in
+   the same format as x-listing-stat, so parseRecursiveLine parses it. No directory
+   listing, so it never touches the siblings. */
+static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
+{
+  struct connectdata *conn = data->conn;
+  struct ssh_conn *sshc = &conn->proto.sshc;
+  curl_socket_t sock = conn->sock[FIRSTSOCKET];
+  LIBSSH2_SESSION *session = sshc->ssh_session;
+  struct rlist_sftp_peek *peek = (struct rlist_sftp_peek *)sshc->sftp_session;
+  LIBSSH2_CHANNEL *channel = peek->channel;
+  unsigned char type, *payload = NULL;
+  size_t payload_len;
+  unsigned long perms = 0, mtime = 0;
+  unsigned long long size = 0;
+  char t, *tgt = NULL;
+  const char *name;
+  CURLcode result;
+
+  name = strrchr(path, '/');
+  name = (name && name[1]) ? name + 1 : path;
+
+  /* LSTAT: detect a symlink, and read the path's own kind/size/mtime */
+  result = sftp_one_roundtrip(channel, sock, session, peek, RLIST_FXP_LSTAT, path,
+                              &type, &payload, &payload_len);
+  if(result)
+    return result;
+  if(type != RLIST_FXP_ATTRS) {          /* STATUS: not found / no permission */
+    free(payload);
+    return CURLE_REMOTE_FILE_NOT_FOUND;
+  }
+  {
+    const unsigned char *p = payload;
+    size_t left = payload_len;
+    if(rlist_parse_attrs(&p, &left, &size, &perms, &mtime) != 0) {
+      free(payload);
+      return CURLE_SSH;
+    }
+  }
+  free(payload);
+  payload = NULL;
+
+  if(!LIBSSH2_SFTP_S_ISLNK(perms)) {     /* plain file/dir: emit its own kind */
+    t = LIBSSH2_SFTP_S_ISDIR(perms) ? 'd' : 'f';
+    return rlist_emit(data, t, size, mtime, name, strlen(name), NULL);
+  }
+
+  /* symlink: FXP_STAT (follows) for the target kind/size/mtime */
+  t = 'l';                               /* broken-link fallback */
+  result = sftp_one_roundtrip(channel, sock, session, peek, RLIST_FXP_STAT, path,
+                              &type, &payload, &payload_len);
+  if(result)
+    return result;
+  if(type == RLIST_FXP_ATTRS) {
+    const unsigned char *p = payload;
+    size_t left = payload_len;
+    unsigned long long tsz = 0;
+    unsigned long tperms = 0, tmt = 0;
+    if(rlist_parse_attrs(&p, &left, &tsz, &tperms, &tmt) == 0) {
+      t = LIBSSH2_SFTP_S_ISDIR(tperms) ? 'd' : 'f';
+      size = tsz;
+      if(tmt)
+        mtime = tmt;
+    }
+  }
+  free(payload);
+  payload = NULL;
+
+  /* FXP_READLINK for the target string (FXP_NAME's first filename) */
+  result = sftp_one_roundtrip(channel, sock, session, peek, RLIST_FXP_READLINK, path,
+                              &type, &payload, &payload_len);
+  if(result)
+    return result;
+  if(type == RLIST_FXP_NAME && payload_len >= 4) {
+    const unsigned char *p = payload;
+    size_t left = payload_len;
+    uint32_t cnt = rlist_ntohu32(p);
+    p += 4;
+    left -= 4;
+    if(cnt >= 1 && left >= 4) {
+      uint32_t tl = rlist_ntohu32(p);
+      p += 4;
+      left -= 4;
+      if(tl <= left) {
+        tgt = malloc(tl + 1);
+        if(tgt) {
+          memcpy(tgt, p, tl);
+          tgt[tl] = '\0';
+        }
+      }
+    }
+  }
+  free(payload);
+
+  result = rlist_emit(data, t, size, mtime, name, strlen(name), tgt);
+  free(tgt);
+  return result;
 }
 /* --- END custom: pipelined recursive SFTP listing ------------------------- */
 
@@ -2382,6 +2522,24 @@ static CURLcode ssh_statemach_act(struct Curl_easy *data, bool *block)
              target kind with a pipelined FXP_STAT on the same channel. Same
              output format and transfer handling as x-list-r. */
           result = sftp_listing_stat(data, sshc->quote_path1);
+          Curl_safefree(sshc->quote_path1);
+          Curl_safefree(sshc->quote_path2);
+          if(result) {
+            sshc->actualcode = result;
+            sshc->nextstate = SSH_NO_STATE;
+            state(data, SSH_SFTP_CLOSE);
+            break;
+          }
+          Curl_setup_transfer(data, -1, -1, FALSE, -1);
+          sshc->nextstate = SSH_NO_STATE;
+          state(data, SSH_STOP);
+          break;
+        }
+        else if(strncasecompare(cmd, "x-stat ", 7)) {
+          /* custom: single-path stat (FXP_LSTAT + FXP_STAT + FXP_READLINK), emitting one
+             line in the x-listing-stat format. No directory listing, so it never resolves
+             the target's siblings. */
+          result = sftp_stat_one(data, sshc->quote_path1);
           Curl_safefree(sshc->quote_path1);
           Curl_safefree(sshc->quote_path2);
           if(result) {
