@@ -974,8 +974,9 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
  * ShellFish's ParallelSFTP uses for parallel stat. The whole walk runs to
  * completion within this one call (driving the socket via select), so it needs
  * no extra fields in ssh_conn/ssh.h. Output: one line per entry to the response
- * body, formatted as "<t> <size> <mtime> <relpath>\n" (t = f/d/l), relpath
- * relative to <path>.
+ * body, formatted as "<t> <size> <mtime> <mode> <uid> <gid> <relpath>\n"
+ * (t = f/d/l; mode is octal st_mode; mode/uid/gid are "-" when the server did
+ * not report them), relpath relative to <path>.
  *
  * Symlink directories are descended into (children emit under the link's
  * relpath). Loop protection: each dir-symlink's FXP_REALPATH-canonical target
@@ -1003,6 +1004,9 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
    socket activity: a server wedged in a filesystem syscall (dead NFS mount,
    autofs trigger like macOS /home) would otherwise hang the walk forever */
 #define RLIST_IDLE_MAX      2
+/* sentinel for "the server did not report this attribute" in mode/uid/gid
+   fields; emitted as "-" on the wire */
+#define RLIST_NO_VALUE ((unsigned long)-1)
 
 /* Mirror the leading fields of libssh2's opaque _LIBSSH2_SFTP so we can reach
    the SFTP channel and the shared request-id counter (channel, then
@@ -1023,13 +1027,16 @@ struct rlist_slot {
   enum rlist_phase phase;
   uint32_t request_id;           /* the slot's currently outstanding request */
   /* symlink resolution runs RL_STATTING (FXP_STAT -> target kind/size/mtime) then
-     RL_READLINKING (FXP_READLINK -> target string). rtype/linksize/linkmtime carry
-     the resolved values between the two; linksize/linkmtime start as the link's own
-     (the fallback emitted for a broken link). */
+     RL_READLINKING (FXP_READLINK -> target string). rtype/linksize/linkmtime/
+     linkmode/linkuid/linkgid carry the resolved values between the two; they
+     start as the link's own (the fallback emitted for a broken link). */
   char rtype;                    /* resolved kind: 'd'/'f', or 'l' for a broken link */
   char *target;                  /* retained field; the target string now comes from readlink */
   unsigned long long linksize;
   unsigned long linkmtime;
+  unsigned long linkmode;
+  unsigned long linkuid;
+  unsigned long linkgid;
 };
 
 /* FIFO queue of heap-allocated relative-path strings (BFS order) */
@@ -1077,12 +1084,17 @@ static void rlist_free(struct rlist_queue *q)
 }
 
 /* FIFO of symlinks discovered during the walk, awaiting a pipelined stat.
-   relpath and target are heap-allocated and owned by the queue until popped. */
+   relpath and target are heap-allocated and owned by the queue until popped.
+   size/mtime/mode/uid/gid are the link's OWN values, the fallback emitted for
+   a broken link. */
 struct rlist_symlink {
   char *relpath;
   char *target;                  /* link destination string, or NULL */
-  unsigned long long linksize;   /* the link's own size (fallback for broken links) */
-  unsigned long linkmtime;       /* the link's own mtime (fallback for broken links) */
+  unsigned long long linksize;
+  unsigned long linkmtime;
+  unsigned long linkmode;
+  unsigned long linkuid;
+  unsigned long linkgid;
 };
 
 struct rlist_symqueue {
@@ -1095,7 +1107,8 @@ struct rlist_symqueue {
 /* takes ownership of relpath and target */
 static CURLcode rlist_sympush(struct rlist_symqueue *q, char *relpath,
                               char *target, unsigned long long sz,
-                              unsigned long mt)
+                              unsigned long mt, unsigned long mode,
+                              unsigned long uid, unsigned long gid)
 {
   if(q->count == q->cap) {
     size_t ncap = q->cap ? q->cap * 2 : 64;
@@ -1109,6 +1122,9 @@ static CURLcode rlist_sympush(struct rlist_symqueue *q, char *relpath,
   q->items[q->count].target = target;
   q->items[q->count].linksize = sz;
   q->items[q->count].linkmtime = mt;
+  q->items[q->count].linkmode = mode;
+  q->items[q->count].linkuid = uid;
+  q->items[q->count].linkgid = gid;
   q->count++;
   return CURLE_OK;
 }
@@ -1330,15 +1346,21 @@ static char *rlist_escape_n(const char *s, size_t len)
   return out;
 }
 
-/* emit one listing line: "<t> <size> <mtime> <esc(name)>[\t<esc(target)>]\n".
-   target is a NUL-terminated link destination for symlinks, or NULL. */
+/* emit one listing line:
+   "<t> <size> <mtime> <mode> <uid> <gid> <esc(name)>[\t<esc(target)>]\n".
+   mode is the octal st_mode (type bits included); mode/uid/gid print as "-"
+   when the server did not report them (RLIST_NO_VALUE). target is a
+   NUL-terminated link destination for symlinks, or NULL. */
 static CURLcode rlist_emit(struct Curl_easy *data, char t,
                            unsigned long long sz, unsigned long mtime,
+                           unsigned long mode, unsigned long uid,
+                           unsigned long gid,
                            const char *name, size_t namelen,
                            const char *target)
 {
   char *en = rlist_escape_n(name, namelen);
   char *et = target ? rlist_escape_n(target, strlen(target)) : NULL;
+  char modebuf[16], uidbuf[24], gidbuf[24];
   char *line;
   CURLcode w;
   if(!en || (target && !et)) {
@@ -1346,8 +1368,22 @@ static CURLcode rlist_emit(struct Curl_easy *data, char t,
     free(et);
     return CURLE_OUT_OF_MEMORY;
   }
-  line = et ? aprintf("%c %llu %lu %s\t%s\n", t, sz, mtime, en, et)
-            : aprintf("%c %llu %lu %s\n", t, sz, mtime, en);
+  if(mode == RLIST_NO_VALUE)
+    strcpy(modebuf, "-");
+  else
+    msnprintf(modebuf, sizeof(modebuf), "%lo", mode & 0177777UL);
+  if(uid == RLIST_NO_VALUE)
+    strcpy(uidbuf, "-");
+  else
+    msnprintf(uidbuf, sizeof(uidbuf), "%lu", uid);
+  if(gid == RLIST_NO_VALUE)
+    strcpy(gidbuf, "-");
+  else
+    msnprintf(gidbuf, sizeof(gidbuf), "%lu", gid);
+  line = et ? aprintf("%c %llu %lu %s %s %s %s\t%s\n", t, sz, mtime,
+                      modebuf, uidbuf, gidbuf, en, et)
+            : aprintf("%c %llu %lu %s %s %s %s\n", t, sz, mtime,
+                      modebuf, uidbuf, gidbuf, en);
   free(en);
   free(et);
   if(!line)
@@ -1357,11 +1393,13 @@ static CURLcode rlist_emit(struct Curl_easy *data, char t,
   return w;
 }
 
-/* parse an SFTP ATTRS blob at *pp (advancing it), filling size/perms/mtime when
-   the matching flag is present. returns 0 on success, -1 on truncation. */
+/* parse an SFTP ATTRS blob at *pp (advancing it), filling size/perms/mtime and
+   uid/gid when the matching flag is present (absent ones keep RLIST_NO_VALUE in
+   uid/gid). returns 0 on success, -1 on truncation. */
 static int rlist_parse_attrs(const unsigned char **pp, size_t *leftp,
                              unsigned long long *sz, unsigned long *perms,
-                             unsigned long *mtime)
+                             unsigned long *mtime,
+                             unsigned long *uid, unsigned long *gid)
 {
   const unsigned char *p = *pp;
   size_t left = *leftp;
@@ -1375,6 +1413,8 @@ static int rlist_parse_attrs(const unsigned char **pp, size_t *leftp,
   }
   if(flags & LIBSSH2_SFTP_ATTR_UIDGID) {
     if(left < 8) return -1;
+    if(uid) *uid = rlist_ntohu32(p);
+    if(gid) *gid = rlist_ntohu32(p + 4);
     p += 8; left -= 8;
   }
   if(flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
@@ -1530,6 +1570,9 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
         slots[i].target = sl.target;
         slots[i].linksize = sl.linksize;
         slots[i].linkmtime = sl.linkmtime;
+        slots[i].linkmode = sl.linkmode;
+        slots[i].linkuid = sl.linkuid;
+        slots[i].linkgid = sl.linkgid;
         slots[i].phase = RL_STATTING;
         slots[i].request_id = req;
         busy++;
@@ -1604,7 +1647,8 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
             const char *fname;
             unsigned long long sz = 0;
             unsigned long mtime = 0;
-            unsigned long perms = 0;
+            unsigned long perms = RLIST_NO_VALUE;
+            unsigned long uid = RLIST_NO_VALUE, gid = RLIST_NO_VALUE;
             int islnk, isdir;
             char *childrel;
 
@@ -1619,7 +1663,7 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
             if(left < ln_len) { result = CURLE_SSH; break; }
             p += ln_len; left -= ln_len;
             /* attrs */
-            if(rlist_parse_attrs(&p, &left, &sz, &perms, &mtime) != 0) {
+            if(rlist_parse_attrs(&p, &left, &sz, &perms, &mtime, &uid, &gid) != 0) {
               result = CURLE_SSH; break;
             }
 
@@ -1638,9 +1682,10 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
 
             if(islnk) {
               /* defer emit: a symlink is resolved with a pipelined FXP_STAT (target
-                 kind) then FXP_READLINK (target string); sz/mtime are the link's own,
-                 kept as the fallback emitted for a broken link */
-              result = rlist_sympush(&symq, childrel, NULL, sz, mtime);
+                 kind) then FXP_READLINK (target string); the attrs are the link's
+                 own, kept as the fallback emitted for a broken link */
+              result = rlist_sympush(&symq, childrel, NULL, sz, mtime,
+                                     perms, uid, gid);
               if(result) { free(childrel); break; }
               emitted++;   /* childrel now owned by symq */
               continue;
@@ -1648,6 +1693,7 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
 
             {
               CURLcode w = rlist_emit(data, isdir ? 'd' : 'f', sz, mtime,
+                                      perms, uid, gid,
                                       childrel, strlen(childrel), NULL);
               emitted++;
               if(w != CURLE_OK) {
@@ -1700,11 +1746,15 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
         const unsigned char *p = payload;
         size_t left = payload_len;
         unsigned long long tsz = 0;
-        unsigned long perms = 0, tmt = 0;
-        if(rlist_parse_attrs(&p, &left, &tsz, &perms, &tmt) == 0) {
+        unsigned long perms = RLIST_NO_VALUE, tmt = 0;
+        unsigned long tuid = RLIST_NO_VALUE, tgid = RLIST_NO_VALUE;
+        if(rlist_parse_attrs(&p, &left, &tsz, &perms, &tmt, &tuid, &tgid) == 0) {
           slot->rtype = LIBSSH2_SFTP_S_ISDIR(perms) ? 'd' : 'f';
           slot->linksize = tsz;
           if(tmt) slot->linkmtime = tmt;
+          if(perms != RLIST_NO_VALUE) slot->linkmode = perms;
+          if(tuid != RLIST_NO_VALUE) slot->linkuid = tuid;
+          if(tgid != RLIST_NO_VALUE) slot->linkgid = tgid;
         }
       }
       {
@@ -1741,6 +1791,7 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
       }
       if(!cancelled) {
         CURLcode w = rlist_emit(data, slot->rtype, slot->linksize, slot->linkmtime,
+                                slot->linkmode, slot->linkuid, slot->linkgid,
                                 slot->relpath, strlen(slot->relpath), tgt);
         if(w != CURLE_OK) cancelled = 1;
       }
@@ -1876,7 +1927,8 @@ static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
   LIBSSH2_CHANNEL *channel = peek->channel;
   unsigned char type, *payload = NULL;
   size_t payload_len;
-  unsigned long perms = 0, mtime = 0;
+  unsigned long perms = RLIST_NO_VALUE, mtime = 0;
+  unsigned long uid = RLIST_NO_VALUE, gid = RLIST_NO_VALUE;
   unsigned long long size = 0;
   char t, *tgt = NULL;
   const char *name;
@@ -1897,7 +1949,7 @@ static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
   {
     const unsigned char *p = payload;
     size_t left = payload_len;
-    if(rlist_parse_attrs(&p, &left, &size, &perms, &mtime) != 0) {
+    if(rlist_parse_attrs(&p, &left, &size, &perms, &mtime, &uid, &gid) != 0) {
       free(payload);
       return CURLE_SSH;
     }
@@ -1907,7 +1959,8 @@ static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
 
   if(!LIBSSH2_SFTP_S_ISLNK(perms)) {     /* plain file/dir: emit its own kind */
     t = LIBSSH2_SFTP_S_ISDIR(perms) ? 'd' : 'f';
-    return rlist_emit(data, t, size, mtime, name, strlen(name), NULL);
+    return rlist_emit(data, t, size, mtime, perms, uid, gid,
+                      name, strlen(name), NULL);
   }
 
   /* symlink: FXP_STAT (follows) for the target kind/size/mtime */
@@ -1920,12 +1973,16 @@ static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
     const unsigned char *p = payload;
     size_t left = payload_len;
     unsigned long long tsz = 0;
-    unsigned long tperms = 0, tmt = 0;
-    if(rlist_parse_attrs(&p, &left, &tsz, &tperms, &tmt) == 0) {
+    unsigned long tperms = RLIST_NO_VALUE, tmt = 0;
+    unsigned long tuid = RLIST_NO_VALUE, tgid = RLIST_NO_VALUE;
+    if(rlist_parse_attrs(&p, &left, &tsz, &tperms, &tmt, &tuid, &tgid) == 0) {
       t = LIBSSH2_SFTP_S_ISDIR(tperms) ? 'd' : 'f';
       size = tsz;
       if(tmt)
         mtime = tmt;
+      if(tperms != RLIST_NO_VALUE) perms = tperms;
+      if(tuid != RLIST_NO_VALUE) uid = tuid;
+      if(tgid != RLIST_NO_VALUE) gid = tgid;
     }
   }
   free(payload);
@@ -1957,7 +2014,8 @@ static CURLcode sftp_stat_one(struct Curl_easy *data, const char *path)
   }
   free(payload);
 
-  result = rlist_emit(data, t, size, mtime, name, strlen(name), tgt);
+  result = rlist_emit(data, t, size, mtime, perms, uid, gid,
+                      name, strlen(name), tgt);
   free(tgt);
   return result;
 }
