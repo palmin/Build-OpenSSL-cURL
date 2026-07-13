@@ -976,10 +976,17 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
  * no extra fields in ssh_conn/ssh.h. Output: one line per entry to the response
  * body, formatted as "<t> <size> <mtime> <relpath>\n" (t = f/d/l), relpath
  * relative to <path>.
+ *
+ * Symlink directories are descended into (children emit under the link's
+ * relpath). Loop protection: each dir-symlink's FXP_REALPATH-canonical target
+ * descends at most once (visited set seeded with the canonical root); since
+ * every cycle traverses a symlink edge this guarantees termination, with
+ * RLIST_MAX_ENTRIES as the global backstop.
  */
 
 #define RLIST_FXP_CLOSE     4
 #define RLIST_FXP_LSTAT     7
+#define RLIST_FXP_REALPATH  16
 #define RLIST_FXP_STAT      17
 #define RLIST_FXP_READLINK  19
 #define RLIST_FXP_OPENDIR   11
@@ -992,6 +999,10 @@ static CURLcode ssh_force_knownhost_key_type(struct Curl_easy *data)
 #define RLIST_WINDOW        24            /* directories in flight at once */
 #define RLIST_MAX_PACKET    (8*1024*1024) /* sanity cap on a response packet */
 #define RLIST_MAX_ENTRIES   500000
+/* abort a read/write after this many consecutive 30s select timeouts with no
+   socket activity: a server wedged in a filesystem syscall (dead NFS mount,
+   autofs trigger like macOS /home) would otherwise hang the walk forever */
+#define RLIST_IDLE_MAX      2
 
 /* Mirror the leading fields of libssh2's opaque _LIBSSH2_SFTP so we can reach
    the SFTP channel and the shared request-id counter (channel, then
@@ -1003,7 +1014,7 @@ struct rlist_sftp_peek {
 };
 
 enum rlist_phase { RL_FREE = 0, RL_OPENING, RL_READING, RL_CLOSING,
-                   RL_STATTING, RL_READLINKING };
+                   RL_STATTING, RL_READLINKING, RL_REALPATHING };
 
 struct rlist_slot {
   char *relpath;                 /* dir: path relative to root; symlink: path to emit */
@@ -1123,6 +1134,51 @@ static void rlist_symqueue_free(struct rlist_symqueue *q)
   q->head = q->count = q->cap = 0;
 }
 
+/* Set of canonical directory paths already scheduled for descent. Holds only
+   the root plus each dir-symlink's REALPATH target, so it stays small and a
+   linear scan suffices. Every cycle traverses a symlink edge, so descending
+   each distinct target at most once guarantees the walk terminates. */
+struct rlist_strset {
+  char **items;
+  size_t count;
+  size_t cap;
+};
+
+/* add s if absent; returns 1 when s was new (added), 0 when already present
+   or on allocation failure (treating failure as "seen" fails safe: we then
+   skip a descent instead of risking an unbounded walk) */
+static int rlist_strset_add(struct rlist_strset *set, const char *s)
+{
+  size_t i;
+  char *dup;
+  for(i = 0; i < set->count; i++)
+    if(strcmp(set->items[i], s) == 0)
+      return 0;
+  if(set->count == set->cap) {
+    size_t ncap = set->cap ? set->cap * 2 : 16;
+    char **n = realloc(set->items, ncap * sizeof(char *));
+    if(!n)
+      return 0;
+    set->items = n;
+    set->cap = ncap;
+  }
+  dup = strdup(s);
+  if(!dup)
+    return 0;
+  set->items[set->count++] = dup;
+  return 1;
+}
+
+static void rlist_strset_free(struct rlist_strset *set)
+{
+  size_t i;
+  for(i = 0; i < set->count; i++)
+    free(set->items[i]);
+  free(set->items);
+  set->items = NULL;
+  set->count = set->cap = 0;
+}
+
 static uint32_t rlist_ntohu32(const unsigned char *b)
 {
   return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
@@ -1143,8 +1199,9 @@ static void rlist_store_u32(unsigned char **p, uint32_t v)
   *p += 4;
 }
 
-/* block (via select) until the channel is ready in the direction libssh2 wants */
-static void rlist_wait(curl_socket_t sock, LIBSSH2_SESSION *session)
+/* block (via select) until the channel is ready in the direction libssh2 wants;
+   returns 1 on readiness, 0 when the 30s wait expired with no socket activity */
+static int rlist_wait(curl_socket_t sock, LIBSSH2_SESSION *session)
 {
   struct timeval timeout;
   fd_set fd;
@@ -1161,41 +1218,53 @@ static void rlist_wait(curl_socket_t sock, LIBSSH2_SESSION *session)
     readfd = &fd;
   if(dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
     writefd = &fd;
-  select((int)(sock + 1), readfd, writefd, NULL, &timeout);
+  return select((int)(sock + 1), readfd, writefd, NULL, &timeout) > 0;
 }
 
-/* write exactly len bytes to the channel; 0 on success, -1 on hard error */
+/* write exactly len bytes to the channel; 0 on success, -1 on hard error or
+   when the channel stays idle past RLIST_IDLE_MAX waits */
 static int rlist_write(LIBSSH2_CHANNEL *channel, curl_socket_t sock,
                        LIBSSH2_SESSION *session,
                        const unsigned char *buf, size_t len)
 {
+  int idle = 0;
   while(len) {
     ssize_t rc = libssh2_channel_write_ex(channel, 0, (const char *)buf, len);
     if(rc == LIBSSH2_ERROR_EAGAIN) {
-      rlist_wait(sock, session);
+      if(rlist_wait(sock, session))
+        idle = 0;
+      else if(++idle >= RLIST_IDLE_MAX)
+        return -1;
       continue;
     }
     if(rc < 0)
       return -1;
+    idle = 0;
     buf += rc;
     len -= (size_t)rc;
   }
   return 0;
 }
 
-/* read exactly len bytes from the channel; 0 on success, -1 on hard error/EOF */
+/* read exactly len bytes from the channel; 0 on success, -1 on hard error/EOF or
+   when the channel stays idle past RLIST_IDLE_MAX waits */
 static int rlist_read(LIBSSH2_CHANNEL *channel, curl_socket_t sock,
                       LIBSSH2_SESSION *session,
                       unsigned char *buf, size_t len)
 {
+  int idle = 0;
   while(len) {
     ssize_t rc = libssh2_channel_read_ex(channel, 0, (char *)buf, len);
     if(rc == LIBSSH2_ERROR_EAGAIN) {
-      rlist_wait(sock, session);
+      if(rlist_wait(sock, session))
+        idle = 0;
+      else if(++idle >= RLIST_IDLE_MAX)
+        return -1;
       continue;
     }
     if(rc <= 0)
       return -1;
+    idle = 0;
     buf += rc;
     len -= (size_t)rc;
   }
@@ -1339,12 +1408,23 @@ static int rlist_parse_attrs(const unsigned char **pp, size_t *leftp,
 
 /* (symlink targets are obtained with FXP_READLINK, not parsed from the longname) */
 
+/* defined below (single-request helper shared with the x-stat path) */
+static CURLcode sftp_one_roundtrip(LIBSSH2_CHANNEL *channel, curl_socket_t sock,
+                                   LIBSSH2_SESSION *session,
+                                   struct rlist_sftp_peek *peek,
+                                   unsigned char reqtype, const char *path,
+                                   unsigned char *outtype,
+                                   unsigned char **outpayload, size_t *outlen);
+
 /* Pipelined SFTP directory walk shared by "x-listing-stat" (one directory,
    recursive=0) and "x-list-r" (whole subtree, recursive=1). Directories are
    opened/read with up to RLIST_WINDOW OPENDIR/READDIR requests in flight; every
    symlink is resolved with a pipelined FXP_STAT (which follows the link) over the
    same window, so its target kind/size is known, and its target string comes free
-   from the readdir longname. One escaped line per entry (see rlist_emit). */
+   from the readdir longname. One escaped line per entry (see rlist_emit).
+   When recursive, dir-symlinks are also descended: after the emit, an FXP_REALPATH
+   canonicalizes the target and the link's relpath joins the dir queue unless that
+   canonical path was already scheduled (visited set = loop/alias protection). */
 static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursive)
 {
   struct connectdata *conn = data->conn;
@@ -1357,6 +1437,7 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
   struct rlist_slot slots[RLIST_WINDOW];
   struct rlist_queue queue;       /* directories still to open (BFS order) */
   struct rlist_symqueue symq;     /* symlinks awaiting a pipelined stat */
+  struct rlist_strset visited;    /* canonical dirs already scheduled for descent */
   int busy = 0;
   int cancelled = 0;              /* set when consume() asks us to stop early */
   long emitted = 0;
@@ -1365,8 +1446,39 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
   memset(slots, 0, sizeof(slots));
   memset(&queue, 0, sizeof(queue));
   memset(&symq, 0, sizeof(symq));
+  memset(&visited, 0, sizeof(visited));
 
   result = rlist_push(&queue, "");   /* the root directory itself */
+
+  /* canonicalize the root so dir-symlinks pointing back into the walked tree
+     are caught by the visited set. sequential: nothing is in flight yet. a
+     STATUS reply falls back to the literal root; a transport error aborts the
+     walk (the channel byte stream may be desynced). */
+  if(!result && recursive) {
+    unsigned char rtype, *rpayload = NULL;
+    size_t rlen;
+    char *rootcanon = NULL;
+    result = sftp_one_roundtrip(channel, sock, session, peek,
+                                RLIST_FXP_REALPATH, root,
+                                &rtype, &rpayload, &rlen);
+    if(!result && rtype == RLIST_FXP_NAME && rlen >= 4) {
+      const unsigned char *p = rpayload;
+      size_t left = rlen;
+      uint32_t cnt = rlist_ntohu32(p); p += 4; left -= 4;
+      if(cnt >= 1 && left >= 4) {
+        uint32_t cl = rlist_ntohu32(p); p += 4; left -= 4;
+        if(cl <= left) {
+          rootcanon = malloc(cl + 1);
+          if(rootcanon) { memcpy(rootcanon, p, cl); rootcanon[cl] = '\0'; }
+        }
+      }
+    }
+    free(rpayload);
+    if(!result) {
+      rlist_strset_add(&visited, rootcanon ? rootcanon : root);
+      free(rootcanon);
+    }
+  }
 
   while(!result &&
         (queue.head < queue.count || symq.head < symq.count || busy > 0)) {
@@ -1633,6 +1745,52 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
         if(w != CURLE_OK) cancelled = 1;
       }
       free(tgt);
+      if(recursive && !cancelled && slot->rtype == 'd') {
+        /* symlink to a directory: REALPATH it so the visited set can decide
+           whether to descend (each canonical target descends at most once) */
+        char *abspath = slot->relpath[0] ? aprintf("%s/%s", root, slot->relpath)
+                                         : strdup(root);
+        if(!abspath)
+          result = CURLE_OUT_OF_MEMORY;
+        else {
+          slot->request_id = peek->request_id++;
+          slot->phase = RL_REALPATHING;
+          if(rlist_send(channel, sock, session, RLIST_FXP_REALPATH,
+                        slot->request_id, (const unsigned char *)abspath,
+                        strlen(abspath)) != 0)
+            result = CURLE_SSH;
+          free(abspath);
+        }
+      }
+      else {
+        free(slot->relpath); free(slot->target);
+        memset(slot, 0, sizeof(*slot));
+        busy--;
+      }
+    }
+    else if(slot->phase == RL_REALPATHING) {
+      /* realpath came back: queue the link's path for descent unless an earlier
+         dir-symlink already resolved to the same canonical target (loop/alias).
+         a STATUS or garbled reply (target vanished, permission) skips descent. */
+      if(type == RLIST_FXP_NAME && payload_len >= 4 && !cancelled &&
+         emitted < RLIST_MAX_ENTRIES) {
+        const unsigned char *p = payload;
+        size_t left = payload_len;
+        uint32_t cnt = rlist_ntohu32(p); p += 4; left -= 4;
+        if(cnt >= 1 && left >= 4) {
+          uint32_t cl = rlist_ntohu32(p); p += 4; left -= 4;
+          if(cl <= left) {
+            char *canon = malloc(cl + 1);
+            if(canon) {
+              memcpy(canon, p, cl);
+              canon[cl] = '\0';
+              if(rlist_strset_add(&visited, canon))
+                result = rlist_push(&queue, slot->relpath);
+              free(canon);
+            }
+          }
+        }
+      }
       free(slot->relpath); free(slot->target);
       memset(slot, 0, sizeof(*slot));
       busy--;
@@ -1647,6 +1805,7 @@ static CURLcode sftp_walk(struct Curl_easy *data, const char *root, int recursiv
   }
   rlist_free(&queue);
   rlist_symqueue_free(&symq);
+  rlist_strset_free(&visited);
 #ifdef DEBUG
   infof(data, "sftp_walk: emitted %ld entries under '%s' (recursive=%d)",
         emitted, root, recursive);
