@@ -38,6 +38,28 @@ This is a long, host-specific compile (real Xcode SDKs, ~tens of minutes). Only 
 when bumping curl/OpenSSL/libssh2 versions or changing `custom-curl-libssh2.c`.
 `clean.sh` removes intermediates; build state is otherwise reused between runs.
 
+`build-curlonly.sh` takes the same flags and skips the OpenSSL and libssh2 stages, reusing
+their existing outputs. Minutes rather than tens of minutes when only curl changed. Its
+last step (archiving Mac binaries) fails on a missing `/tmp/openssl-*` because that stage
+was skipped; the xcframeworks are already written by then, so it is harmless.
+
+### Autoconf feature detection is not to be trusted
+
+curl's configure decides several features with **run** tests, which it skips in favour of a
+free "yes" when cross compiling. iOS and tvOS genuinely cross compile; the Mac slices build
+natively, so their probes really run, and a probe that fails to *compile* silently reads as
+"feature absent". curl 8.1.2's IPv6 probe is a K&R `main()`, which clang 16+ rejects outright
+(`-Wimplicit-int`), so Mac shipped without IPv6 for a while: AAAA-only hosts would not
+resolve, literal IPv6 addresses failed, and `CURLOPT_IPRESOLVE` was ignored. Hence the
+explicit `--enable-ipv6` in `CONF_FLAGS`.
+
+After any rebuild, check the features actually landed rather than assuming, per arch:
+```bash
+nm -arch arm64 LibCurl/libs/libcurl.xcframework/macos-arm64_x86_64/libcurl.a | grep _Curl_ipv6works
+```
+`FTPTests/IPv6ResolutionTests.testBundledCurlSupportsIPv6` asserts this from the app side on
+every platform, so `scripts/pre-release-tests` catches a regression here.
+
 ## Build stages
 
 `build.sh` runs the stages in order, each via its own sub-script:
